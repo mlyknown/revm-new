@@ -1,3 +1,4 @@
+use crate::optimism::fast_lz::flz_compress_len;
 use crate::primitives::{address, db::Database, Address, SpecId, U256};
 use core::ops::Mul;
 
@@ -98,7 +99,7 @@ impl L1BlockInfo {
 
             // Check if the L1 fee scalars are empty. If so, we use the Bedrock cost function. The L1 fee overhead is
             // only necessary if `empty_scalars` is true, as it was deprecated in Ecotone.
-            let empty_scalars = l1_blob_base_fee == U256::ZERO
+            let empty_scalars = l1_blob_base_fee.is_zero()
                 && l1_fee_scalars[BASE_FEE_SCALAR_OFFSET..BLOB_BASE_FEE_SCALAR_OFFSET + 4]
                     == EMPTY_SCALARS;
             let l1_fee_overhead = empty_scalars
@@ -116,12 +117,22 @@ impl L1BlockInfo {
         }
     }
 
-    /// Calculate the data gas for posting the transaction on L1. Calldata costs 16 gas per non-zero
-    /// byte and 4 gas per zero byte.
+    /// Calculate the data gas for posting the transaction on L1. Calldata costs 16 gas per byte
+    /// after compression.
+    ///
+    /// Prior to fjord, calldata costs 16 gas per non-zero byte and 4 gas per zero byte.
     ///
     /// Prior to regolith, an extra 68 non-zero bytes were included in the rollup data costs to
     /// account for the empty signature.
     pub fn data_gas(&self, input: &[u8], spec_id: SpecId) -> U256 {
+        if spec_id.is_enabled_in(SpecId::FJORD) {
+            let estimated_size = self.tx_estimated_size_fjord(input);
+
+            return estimated_size
+                .saturating_mul(U256::from(NON_ZERO_BYTE_COST))
+                .wrapping_div(U256::from(1_000_000));
+        };
+
         let mut rollup_data_gas_cost = U256::from(input.iter().fold(0, |acc, byte| {
             acc + if *byte == 0x00 {
                 ZERO_BYTE_COST
@@ -138,6 +149,18 @@ impl L1BlockInfo {
         rollup_data_gas_cost
     }
 
+    // Calculate the estimated compressed transaction size in bytes, scaled by 1e6.
+    // This value is computed based on the following formula:
+    // max(minTransactionSize, intercept + fastlzCoef*fastlzSize)
+    fn tx_estimated_size_fjord(&self, input: &[u8]) -> U256 {
+        let fastlz_size = U256::from(flz_compress_len(input));
+
+        fastlz_size
+            .saturating_mul(U256::from(836_500))
+            .saturating_sub(U256::from(42_585_600))
+            .max(U256::from(100_000_000))
+    }
+
     /// Calculate the gas cost of a transaction based on L1 block data posted on L2, depending on the [SpecId] passed.
     pub fn calculate_tx_l1_cost(&self, input: &[u8], spec_id: SpecId) -> U256 {
         // If the input is a deposit transaction or empty, the default value is zero.
@@ -145,7 +168,9 @@ impl L1BlockInfo {
             return U256::ZERO;
         }
 
-        if spec_id.is_enabled_in(SpecId::ECOTONE) {
+        if spec_id.is_enabled_in(SpecId::FJORD) {
+            self.calculate_tx_l1_cost_fjord(input)
+        } else if spec_id.is_enabled_in(SpecId::ECOTONE) {
             self.calculate_tx_l1_cost_ecotone(input, spec_id)
         } else {
             self.calculate_tx_l1_cost_bedrock(input, spec_id)
@@ -181,26 +206,45 @@ impl L1BlockInfo {
         }
 
         let rollup_data_gas_cost = self.data_gas(input, spec_id);
+        let l1_fee_scaled = self.calculate_l1_fee_scaled_ecotone();
+
+        l1_fee_scaled
+            .saturating_mul(rollup_data_gas_cost)
+            .wrapping_div(U256::from(1_000_000 * NON_ZERO_BYTE_COST))
+    }
+
+    /// Calculate the gas cost of a transaction based on L1 block data posted on L2, post-Fjord.
+    ///
+    /// [SpecId::FJORD] L1 cost function:
+    /// `estimatedSize*(baseFeeScalar*l1BaseFee*16 + blobFeeScalar*l1BlobBaseFee)/1e12`
+    fn calculate_tx_l1_cost_fjord(&self, input: &[u8]) -> U256 {
+        let l1_fee_scaled = self.calculate_l1_fee_scaled_ecotone();
+        let estimated_size = self.tx_estimated_size_fjord(input);
+
+        estimated_size
+            .saturating_mul(l1_fee_scaled)
+            .wrapping_div(U256::from(1_000_000_000_000u64))
+    }
+
+    // l1BaseFee*16*l1BaseFeeScalar + l1BlobBaseFee*l1BlobBaseFeeScalar
+    fn calculate_l1_fee_scaled_ecotone(&self) -> U256 {
         let calldata_cost_per_byte = self
             .l1_base_fee
-            .saturating_mul(U256::from(16))
+            .saturating_mul(U256::from(NON_ZERO_BYTE_COST))
             .saturating_mul(self.l1_base_fee_scalar);
         let blob_cost_per_byte = self
             .l1_blob_base_fee
             .unwrap_or_default()
             .saturating_mul(self.l1_blob_base_fee_scalar.unwrap_or_default());
 
-        calldata_cost_per_byte
-            .saturating_add(blob_cost_per_byte)
-            .saturating_mul(rollup_data_gas_cost)
-            .wrapping_div(U256::from(1_000_000 * 16))
+        calldata_cost_per_byte.saturating_add(blob_cost_per_byte)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::primitives::bytes;
+    use crate::primitives::{bytes, hex};
 
     #[test]
     fn test_data_gas_non_zero_bytes() {
@@ -225,6 +269,11 @@ mod tests {
         // gas cost = 3 * 16 = 48
         let regolith_data_gas = l1_block_info.data_gas(&input, SpecId::REGOLITH);
         assert_eq!(regolith_data_gas, U256::from(48));
+
+        // Fjord has a minimum compressed size of 100 bytes
+        // gas cost = 100 * 16 = 1600
+        let fjord_data_gas = l1_block_info.data_gas(&input, SpecId::FJORD);
+        assert_eq!(fjord_data_gas, U256::from(1600));
     }
 
     #[test]
@@ -250,6 +299,11 @@ mod tests {
         // gas cost = 3 * 16 + 2 * 4 = 56
         let regolith_data_gas = l1_block_info.data_gas(&input, SpecId::REGOLITH);
         assert_eq!(regolith_data_gas, U256::from(56));
+
+        // Fjord has a minimum compressed size of 100 bytes
+        // gas cost = 100 * 16 = 1600
+        let fjord_data_gas = l1_block_info.data_gas(&input, SpecId::FJORD);
+        assert_eq!(fjord_data_gas, U256::from(1600));
     }
 
     #[test]
@@ -309,5 +363,87 @@ mod tests {
         let input = bytes!("FACADE");
         let gas_cost = l1_block_info.calculate_tx_l1_cost(&input, SpecId::ECOTONE);
         assert_eq!(gas_cost, U256::from(1048));
+    }
+
+    #[test]
+    fn test_calculate_tx_l1_cost_fjord() {
+        // l1FeeScaled = baseFeeScalar*l1BaseFee*16 + blobFeeScalar*l1BlobBaseFee
+        //             = 1000 * 1000 * 16 + 1000 * 1000
+        //             = 17e6
+        let l1_block_info = L1BlockInfo {
+            l1_base_fee: U256::from(1_000),
+            l1_base_fee_scalar: U256::from(1_000),
+            l1_blob_base_fee: Some(U256::from(1_000)),
+            l1_blob_base_fee_scalar: Some(U256::from(1_000)),
+            ..Default::default()
+        };
+
+        // fastLzSize = 4
+        // estimatedSize = max(minTransactionSize, intercept + fastlzCoef*fastlzSize)
+        //               = max(100e6, 836500*4 - 42585600)
+        //               = 100e6
+        let input = bytes!("FACADE");
+        // l1Cost = estimatedSize * l1FeeScaled / 1e12
+        //        = 100e6 * 17 / 1e6
+        //        = 1700
+        let gas_cost = l1_block_info.calculate_tx_l1_cost(&input, SpecId::FJORD);
+        assert_eq!(gas_cost, U256::from(1700));
+
+        // fastLzSize = 202
+        // estimatedSize = max(minTransactionSize, intercept + fastlzCoef*fastlzSize)
+        //               = max(100e6, 836500*202 - 42585600)
+        //               = 126387400
+        let input = bytes!("02f901550a758302df1483be21b88304743f94f80e51afb613d764fa61751affd3313c190a86bb870151bd62fd12adb8e41ef24f3f000000000000000000000000000000000000000000000000000000000000006e000000000000000000000000af88d065e77c8cc2239327c5edb3a432268e5831000000000000000000000000000000000000000000000000000000000003c1e5000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a000000000000000000000000000000000000000000000000000000000000000148c89ed219d02f1a5be012c689b4f5b731827bebe000000000000000000000000c001a033fd89cb37c31b2cba46b6466e040c61fc9b2a3675a7f5f493ebd5ad77c497f8a07cdf65680e238392693019b4092f610222e71b7cec06449cb922b93b6a12744e");
+        // l1Cost = estimatedSize * l1FeeScaled / 1e12
+        //        = 126387400 * 17 / 1e6
+        //        = 2148
+        let gas_cost = l1_block_info.calculate_tx_l1_cost(&input, SpecId::FJORD);
+        assert_eq!(gas_cost, U256::from(2148));
+
+        // Zero rollup data gas cost should result in zero
+        let input = bytes!("");
+        let gas_cost = l1_block_info.calculate_tx_l1_cost(&input, SpecId::FJORD);
+        assert_eq!(gas_cost, U256::ZERO);
+
+        // Deposit transactions with the EIP-2718 type of 0x7F should result in zero
+        let input = bytes!("7FFACADE");
+        let gas_cost = l1_block_info.calculate_tx_l1_cost(&input, SpecId::FJORD);
+        assert_eq!(gas_cost, U256::ZERO);
+    }
+
+    #[test]
+    fn calculate_tx_l1_cost_fjord() {
+        // rig
+
+        // L1 block info for OP mainnet fjord block 124665056
+        // <https://optimistic.etherscan.io/block/124665056>
+        let l1_block_info = L1BlockInfo {
+            l1_base_fee: U256::from(1055991687),
+            l1_base_fee_scalar: U256::from(5227),
+            l1_blob_base_fee_scalar: Some(U256::from(1014213)),
+            l1_blob_base_fee: Some(U256::from(1)),
+            ..Default::default() // l1 fee overhead (l1 gas used) deprecated since Fjord
+        };
+
+        // second tx in OP mainnet Fjord block 124665056
+        // <https://optimistic.etherscan.io/tx/0x1059e8004daff32caa1f1b1ef97fe3a07a8cf40508f5b835b66d9420d87c4a4a>
+        const TX: &[u8] = &hex!("02f904940a8303fba78401d6d2798401db2b6d830493e0943e6f4f7866654c18f536170780344aa8772950b680b904246a761202000000000000000000000000087000a300de7200382b55d40045000000e5d60e0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000014000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003a0000000000000000000000000000000000000000000000000000000000000022482ad56cb0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000120000000000000000000000000dc6ff44d5d932cbd77b52e5612ba0529dc6226f1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000044095ea7b300000000000000000000000021c4928109acb0659a88ae5329b5374a3024694c0000000000000000000000000000000000000000000000049b9ca9a6943400000000000000000000000000000000000000000000000000000000000000000000000000000000000021c4928109acb0659a88ae5329b5374a3024694c000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000024b6b55f250000000000000000000000000000000000000000000000049b9ca9a694340000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000415ec214a3950bea839a7e6fbb0ba1540ac2076acd50820e2d5ef83d0902cdffb24a47aff7de5190290769c4f0a9c6fabf63012986a0d590b1b571547a8c7050ea1b00000000000000000000000000000000000000000000000000000000000000c080a06db770e6e25a617fe9652f0958bd9bd6e49281a53036906386ed39ec48eadf63a07f47cf51a4a40b4494cf26efc686709a9b03939e20ee27e59682f5faa536667e");
+
+        // l1 gas used for tx and l1 fee for tx, from OP mainnet block scanner
+        // https://optimistic.etherscan.io/tx/0x1059e8004daff32caa1f1b1ef97fe3a07a8cf40508f5b835b66d9420d87c4a4a
+        let expected_data_gas = U256::from(4471);
+        let expected_l1_fee = U256::from_be_bytes(hex!(
+            "00000000000000000000000000000000000000000000000000000005bf1ab43d"
+        ));
+
+        // test
+
+        let data_gas = l1_block_info.data_gas(TX, SpecId::FJORD);
+
+        assert_eq!(data_gas, expected_data_gas);
+
+        let l1_fee = l1_block_info.calculate_tx_l1_cost_fjord(TX);
+
+        assert_eq!(l1_fee, expected_l1_fee)
     }
 }

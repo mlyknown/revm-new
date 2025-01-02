@@ -1,89 +1,53 @@
-use crate::{hex, keccak256, Bytes, B256, KECCAK_EMPTY};
-use bitvec::{
-    prelude::{bitvec, Lsb0},
-    vec::BitVec,
+pub mod eof;
+pub mod legacy;
+
+pub use eof::{Eof, EOF_MAGIC, EOF_MAGIC_BYTES, EOF_MAGIC_HASH};
+pub use legacy::{JumpTable, LegacyAnalyzedBytecode};
+
+use crate::{
+    eip7702::bytecode::Eip7702DecodeError, keccak256, Bytes, Eip7702Bytecode, B256,
+    EIP7702_MAGIC_BYTES, KECCAK_EMPTY,
 };
+use alloy_primitives::Address;
 use core::fmt::Debug;
-use std::{sync::Arc, vec::Vec};
-
-/// A map of valid `jump` destinations.
-#[derive(Clone, Default, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct JumpMap(pub Arc<BitVec<u8>>);
-
-impl Debug for JumpMap {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("JumpMap")
-            .field("map", &hex::encode(self.0.as_raw_slice()))
-            .finish()
-    }
-}
-
-impl JumpMap {
-    /// Get the raw bytes of the jump map
-    #[inline]
-    pub fn as_slice(&self) -> &[u8] {
-        self.0.as_raw_slice()
-    }
-
-    /// Construct a jump map from raw bytes
-    #[inline]
-    pub fn from_slice(slice: &[u8]) -> Self {
-        Self(Arc::new(BitVec::from_slice(slice)))
-    }
-
-    /// Check if `pc` is a valid jump destination.
-    #[inline]
-    pub fn is_valid(&self, pc: usize) -> bool {
-        pc < self.0.len() && self.0[pc]
-    }
-}
+use eof::EofDecodeError;
+use std::{fmt, sync::Arc};
 
 /// State of the [`Bytecode`] analysis.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum BytecodeState {
+pub enum Bytecode {
     /// No analysis has been performed.
-    Raw,
-    /// The bytecode has been checked for validity.
-    Checked { len: usize },
+    LegacyRaw(Bytes),
     /// The bytecode has been analyzed for valid jump destinations.
-    Analysed { len: usize, jump_map: JumpMap },
-}
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Bytecode {
-    pub bytecode: Bytes,
-    pub state: BytecodeState,
-}
-
-impl Debug for Bytecode {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Bytecode")
-            .field("bytecode", &self.bytecode)
-            .field("state", &self.state)
-            .finish()
-    }
+    LegacyAnalyzed(LegacyAnalyzedBytecode),
+    /// Ethereum Object Format
+    Eof(Arc<Eof>),
+    /// EIP-7702 delegated bytecode
+    Eip7702(Eip7702Bytecode),
 }
 
 impl Default for Bytecode {
     #[inline]
     fn default() -> Self {
-        Bytecode::new()
+        // Creates a new legacy analyzed [`Bytecode`] with exactly one STOP opcode.
+        Self::new()
     }
 }
 
 impl Bytecode {
-    /// Creates a new [`Bytecode`] with exactly one STOP opcode.
+    // Creates a new legacy analyzed [`Bytecode`] with exactly one STOP opcode.
     #[inline]
     pub fn new() -> Self {
-        Bytecode {
-            bytecode: Bytes::from_static(&[0]),
-            state: BytecodeState::Analysed {
-                len: 0,
-                jump_map: JumpMap(Arc::new(bitvec![u8, Lsb0; 0])),
-            },
+        Self::LegacyAnalyzed(LegacyAnalyzedBytecode::default())
+    }
+
+    /// Return jump table if bytecode is analyzed
+    #[inline]
+    pub fn legacy_jump_table(&self) -> Option<&JumpTable> {
+        match &self {
+            Self::LegacyAnalyzed(analyzed) => Some(analyzed.jump_table()),
+            _ => None,
         }
     }
 
@@ -92,16 +56,68 @@ impl Bytecode {
         if self.is_empty() {
             KECCAK_EMPTY
         } else {
-            keccak256(&self.original_bytes())
+            keccak256(self.original_byte_slice())
         }
     }
 
+    /// Return reference to the EOF if bytecode is EOF.
+    #[inline]
+    pub const fn eof(&self) -> Option<&Arc<Eof>> {
+        match self {
+            Self::Eof(eof) => Some(eof),
+            _ => None,
+        }
+    }
+
+    /// Returns true if bytecode is EOF.
+    #[inline]
+    pub const fn is_eof(&self) -> bool {
+        matches!(self, Self::Eof(_))
+    }
+
+    /// Returns true if bytecode is EIP-7702.
+    pub const fn is_eip7702(&self) -> bool {
+        matches!(self, Self::Eip7702(_))
+    }
+
+    /// Creates a new legacy [`Bytecode`].
+    #[inline]
+    pub fn new_legacy(raw: Bytes) -> Self {
+        Self::LegacyRaw(raw)
+    }
+
     /// Creates a new raw [`Bytecode`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if bytecode is in incorrect format.
     #[inline]
     pub fn new_raw(bytecode: Bytes) -> Self {
-        Self {
-            bytecode,
-            state: BytecodeState::Raw,
+        Self::new_raw_checked(bytecode).expect("Expect correct EOF bytecode")
+    }
+
+    /// Creates a new EIP-7702 [`Bytecode`] from [`Address`].
+    #[inline]
+    pub fn new_eip7702(address: Address) -> Self {
+        Self::Eip7702(Eip7702Bytecode::new(address))
+    }
+
+    /// Creates a new raw [`Bytecode`].
+    ///
+    /// Returns an error on incorrect Bytecode format.
+    #[inline]
+    pub fn new_raw_checked(bytecode: Bytes) -> Result<Self, BytecodeDecodeError> {
+        let prefix = bytecode.get(..2);
+        match prefix {
+            Some(prefix) if prefix == &EOF_MAGIC_BYTES => {
+                let eof = Eof::decode(bytecode)?;
+                Ok(Self::Eof(Arc::new(eof)))
+            }
+            Some(prefix) if prefix == &EIP7702_MAGIC_BYTES => {
+                let eip7702 = Eip7702Bytecode::new_raw(bytecode)?;
+                Ok(Self::Eip7702(eip7702))
+            }
+            _ => Ok(Self::LegacyRaw(bytecode)),
         }
     }
 
@@ -111,37 +127,83 @@ impl Bytecode {
     ///
     /// Bytecode needs to end with STOP (0x00) opcode as checked bytecode assumes
     /// that it is safe to iterate over bytecode without checking lengths.
-    pub unsafe fn new_checked(bytecode: Bytes, len: usize) -> Self {
-        Self {
+    pub unsafe fn new_analyzed(
+        bytecode: Bytes,
+        original_len: usize,
+        jump_table: JumpTable,
+    ) -> Self {
+        Self::LegacyAnalyzed(LegacyAnalyzedBytecode::new(
             bytecode,
-            state: BytecodeState::Checked { len },
-        }
+            original_len,
+            jump_table,
+        ))
     }
 
     /// Returns a reference to the bytecode.
+    ///
+    /// In case of EOF this will be the first code section.
     #[inline]
-    pub fn bytes(&self) -> &Bytes {
-        &self.bytecode
+    pub fn bytecode(&self) -> &Bytes {
+        match self {
+            Self::LegacyRaw(bytes) => bytes,
+            Self::LegacyAnalyzed(analyzed) => analyzed.bytecode(),
+            Self::Eof(eof) => eof
+                .body
+                .code(0)
+                .expect("Valid EOF has at least one code section"),
+            Self::Eip7702(code) => code.raw(),
+        }
+    }
+
+    /// Returns false if bytecode can't be executed in Interpreter.
+    pub fn is_execution_ready(&self) -> bool {
+        !matches!(self, Self::LegacyRaw(_))
+    }
+
+    /// Returns bytes
+    #[inline]
+    pub fn bytes(&self) -> Bytes {
+        match self {
+            Self::LegacyAnalyzed(analyzed) => analyzed.bytecode().clone(),
+            _ => self.original_bytes(),
+        }
+    }
+
+    /// Returns bytes slice
+    #[inline]
+    pub fn bytes_slice(&self) -> &[u8] {
+        match self {
+            Self::LegacyAnalyzed(analyzed) => analyzed.bytecode(),
+            _ => self.original_byte_slice(),
+        }
     }
 
     /// Returns a reference to the original bytecode.
     #[inline]
     pub fn original_bytes(&self) -> Bytes {
-        match self.state {
-            BytecodeState::Raw => self.bytecode.clone(),
-            BytecodeState::Checked { len } | BytecodeState::Analysed { len, .. } => {
-                self.bytecode.slice(0..len)
-            }
+        match self {
+            Self::LegacyRaw(bytes) => bytes.clone(),
+            Self::LegacyAnalyzed(analyzed) => analyzed.original_bytes(),
+            Self::Eof(eof) => eof.raw().clone(),
+            Self::Eip7702(eip7702) => eip7702.raw().clone(),
         }
     }
 
-    /// Returns the length of the bytecode.
+    /// Returns the original bytecode as a byte slice.
+    #[inline]
+    pub fn original_byte_slice(&self) -> &[u8] {
+        match self {
+            Self::LegacyRaw(bytes) => bytes,
+            Self::LegacyAnalyzed(analyzed) => analyzed.original_byte_slice(),
+            Self::Eof(eof) => eof.raw(),
+            Self::Eip7702(eip7702) => eip7702.raw(),
+        }
+    }
+
+    /// Returns the length of the original bytes.
     #[inline]
     pub fn len(&self) -> usize {
-        match self.state {
-            BytecodeState::Raw => self.bytecode.len(),
-            BytecodeState::Checked { len, .. } | BytecodeState::Analysed { len, .. } => len,
-        }
+        self.original_byte_slice().len()
     }
 
     /// Returns whether the bytecode is empty.
@@ -149,26 +211,62 @@ impl Bytecode {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
 
-    /// Returns the [`BytecodeState`].
-    #[inline]
-    pub fn state(&self) -> &BytecodeState {
-        &self.state
+/// EOF decode errors.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum BytecodeDecodeError {
+    /// EOF decode error
+    Eof(EofDecodeError),
+    /// EIP-7702 decode error
+    Eip7702(Eip7702DecodeError),
+}
+
+impl From<EofDecodeError> for BytecodeDecodeError {
+    fn from(error: EofDecodeError) -> Self {
+        Self::Eof(error)
     }
+}
 
-    pub fn to_checked(self) -> Self {
-        match self.state {
-            BytecodeState::Raw => {
-                let len = self.bytecode.len();
-                let mut padded_bytecode = Vec::with_capacity(len + 33);
-                padded_bytecode.extend_from_slice(&self.bytecode);
-                padded_bytecode.resize(len + 33, 0);
-                Self {
-                    bytecode: padded_bytecode.into(),
-                    state: BytecodeState::Checked { len },
-                }
+impl From<Eip7702DecodeError> for BytecodeDecodeError {
+    fn from(error: Eip7702DecodeError) -> Self {
+        Self::Eip7702(error)
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for BytecodeDecodeError {}
+
+impl fmt::Display for BytecodeDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Eof(e) => fmt::Display::fmt(e, f),
+            Self::Eip7702(e) => fmt::Display::fmt(e, f),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Bytecode, Eof};
+    use std::sync::Arc;
+
+    #[test]
+    fn eof_arc_clone() {
+        let eof = Arc::new(Eof::default());
+        let bytecode = Bytecode::Eof(Arc::clone(&eof));
+
+        // Cloning the Bytecode should not clone the underlying Eof
+        let cloned_bytecode = bytecode.clone();
+        if let Bytecode::Eof(original_arc) = bytecode {
+            if let Bytecode::Eof(cloned_arc) = cloned_bytecode {
+                assert!(Arc::ptr_eq(&original_arc, &cloned_arc));
+            } else {
+                panic!("Cloned bytecode is not Eof");
             }
-            _ => self,
+        } else {
+            panic!("Original bytecode is not Eof");
         }
     }
 }

@@ -1,31 +1,53 @@
 use crate::{
     db::Database,
+    frame::EOFCreateFrame,
     interpreter::{
         return_ok, return_revert, CallInputs, CreateInputs, CreateOutcome, Gas, InstructionResult,
         SharedMemory,
     },
-    primitives::{EVMError, Env, Spec},
+    primitives::{EVMError, Spec},
     CallFrame, Context, CreateFrame, Frame, FrameOrResult, FrameResult,
+};
+use core::mem;
+use revm_interpreter::{
+    opcode::InstructionTables, CallOutcome, EOFCreateInputs, InterpreterAction, InterpreterResult,
+    EMPTY_SHARED_MEMORY,
 };
 use std::boxed::Box;
 
-use revm_interpreter::{CallOutcome, InterpreterResult};
-
-/// Helper function called inside [`last_frame_return`]
+/// Execute frame
 #[inline]
-pub fn frame_return_with_refund_flag<SPEC: Spec>(
-    env: &Env,
+pub fn execute_frame<SPEC: Spec, EXT, DB: Database>(
+    frame: &mut Frame,
+    shared_memory: &mut SharedMemory,
+    instruction_tables: &InstructionTables<'_, Context<EXT, DB>>,
+    context: &mut Context<EXT, DB>,
+) -> Result<InterpreterAction, EVMError<DB::Error>> {
+    let interpreter = frame.interpreter_mut();
+    let memory = mem::replace(shared_memory, EMPTY_SHARED_MEMORY);
+    let next_action = match instruction_tables {
+        InstructionTables::Plain(table) => interpreter.run(memory, table, context),
+        InstructionTables::Boxed(table) => interpreter.run(memory, table, context),
+    };
+    // Take the shared memory back.
+    *shared_memory = interpreter.take_memory();
+
+    Ok(next_action)
+}
+
+/// Handle output of the transaction
+#[inline]
+pub fn last_frame_return<SPEC: Spec, EXT, DB: Database>(
+    context: &mut Context<EXT, DB>,
     frame_result: &mut FrameResult,
-    refund_enabled: bool,
-) {
+) -> Result<(), EVMError<DB::Error>> {
     let instruction_result = frame_result.interpreter_result().result;
     let gas = frame_result.gas_mut();
     let remaining = gas.remaining();
     let refunded = gas.refunded();
 
     // Spend the gas limit. Gas is reimbursed when the tx returns successfully.
-    *gas = Gas::new(env.tx.gas_limit);
-    gas.record_cost(env.tx.gas_limit);
+    *gas = Gas::new_spent(context.evm.env.tx.gas_limit);
 
     match instruction_result {
         return_ok!() => {
@@ -37,24 +59,6 @@ pub fn frame_return_with_refund_flag<SPEC: Spec>(
         }
         _ => {}
     }
-
-    // Calculate gas refund for transaction.
-    // If config is set to disable gas refund, it will return 0.
-    // If spec is set to london, it will decrease the maximum refund amount to 5th part of
-    // gas spend. (Before london it was 2th part of gas spend)
-    if refund_enabled {
-        // EIP-3529: Reduction in refunds
-        gas.set_final_refund::<SPEC>();
-    }
-}
-
-/// Handle output of the transaction
-#[inline]
-pub fn last_frame_return<SPEC: Spec, EXT, DB: Database>(
-    context: &mut Context<EXT, DB>,
-    frame_result: &mut FrameResult,
-) -> Result<(), EVMError<DB::Error>> {
-    frame_return_with_refund_flag::<SPEC>(&context.evm.env, frame_result, true);
     Ok(())
 }
 
@@ -89,7 +93,7 @@ pub fn insert_call_outcome<EXT, DB: Database>(
     shared_memory: &mut SharedMemory,
     outcome: CallOutcome,
 ) -> Result<(), EVMError<DB::Error>> {
-    core::mem::replace(&mut context.evm.error, Ok(()))?;
+    context.evm.take_error()?;
     frame
         .frame_data_mut()
         .interpreter
@@ -129,7 +133,7 @@ pub fn insert_create_outcome<EXT, DB: Database>(
     frame: &mut Frame,
     outcome: CreateOutcome,
 ) -> Result<(), EVMError<DB::Error>> {
-    core::mem::replace(&mut context.evm.error, Ok(()))?;
+    context.evm.take_error()?;
     frame
         .frame_data_mut()
         .interpreter
@@ -137,18 +141,60 @@ pub fn insert_create_outcome<EXT, DB: Database>(
     Ok(())
 }
 
+/// Handle frame sub create.
+#[inline]
+pub fn eofcreate<SPEC: Spec, EXT, DB: Database>(
+    context: &mut Context<EXT, DB>,
+    inputs: Box<EOFCreateInputs>,
+) -> Result<FrameOrResult, EVMError<DB::Error>> {
+    context.evm.make_eofcreate_frame(SPEC::SPEC_ID, &inputs)
+}
+
+#[inline]
+pub fn eofcreate_return<SPEC: Spec, EXT, DB: Database>(
+    context: &mut Context<EXT, DB>,
+    frame: Box<EOFCreateFrame>,
+    mut interpreter_result: InterpreterResult,
+) -> Result<CreateOutcome, EVMError<DB::Error>> {
+    context.evm.eofcreate_return::<SPEC>(
+        &mut interpreter_result,
+        frame.created_address,
+        frame.frame_data.checkpoint,
+    );
+    Ok(CreateOutcome::new(
+        interpreter_result,
+        Some(frame.created_address),
+    ))
+}
+
+#[inline]
+pub fn insert_eofcreate_outcome<EXT, DB: Database>(
+    context: &mut Context<EXT, DB>,
+    frame: &mut Frame,
+    outcome: CreateOutcome,
+) -> Result<(), EVMError<DB::Error>> {
+    core::mem::replace(&mut context.evm.error, Ok(()))?;
+    frame
+        .frame_data_mut()
+        .interpreter
+        .insert_eofcreate_outcome(outcome);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use revm_interpreter::{primitives::CancunSpec, InterpreterResult};
-    use revm_precompile::Bytes;
-
     use super::*;
+    use crate::handler::mainnet::refund;
+    use crate::primitives::{CancunSpec, Env};
+    use revm_precompile::Bytes;
 
     /// Creates frame result.
     fn call_last_frame_return(instruction_result: InstructionResult, gas: Gas) -> Gas {
         let mut env = Env::default();
         env.tx.gas_limit = 100;
 
+        let mut ctx = Context::new_empty();
+        ctx.evm.inner.env = Box::new(env);
         let mut first_frame = FrameResult::Call(CallOutcome::new(
             InterpreterResult {
                 result: instruction_result,
@@ -157,7 +203,8 @@ mod tests {
             },
             0..0,
         ));
-        frame_return_with_refund_flag::<CancunSpec>(&env, &mut first_frame, true);
+        last_frame_return::<CancunSpec, _, _>(&mut ctx, &mut first_frame).unwrap();
+        refund::<CancunSpec, _, _>(&mut ctx, first_frame.gas_mut(), 0);
         *first_frame.gas()
     }
 
@@ -169,7 +216,6 @@ mod tests {
         assert_eq!(gas.refunded(), 0);
     }
 
-    // TODO
     #[test]
     fn test_consume_gas_with_refund() {
         let mut return_gas = Gas::new(90);

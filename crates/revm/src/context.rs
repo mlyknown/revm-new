@@ -8,10 +8,12 @@ pub use context_precompiles::{
 };
 pub use evm_context::EvmContext;
 pub use inner_evm_context::InnerEvmContext;
+use revm_interpreter::{as_u64_saturated, Eip7702CodeLoad, StateLoad};
 
 use crate::{
     db::{Database, EmptyDB},
-    primitives::HandlerCfg,
+    interpreter::{AccountLoad, Host, SStoreResult, SelfDestructResult},
+    primitives::{Address, Bytes, Env, HandlerCfg, Log, B256, BLOCK_HASH_HISTORY, U256},
 };
 use std::boxed::Box;
 
@@ -92,5 +94,112 @@ where
             context: self.context.clone(),
             cfg: self.cfg,
         }
+    }
+}
+
+impl<EXT, DB: Database> Host for Context<EXT, DB> {
+    /// Returns reference to Environment.
+    #[inline]
+    fn env(&self) -> &Env {
+        &self.evm.env
+    }
+
+    fn env_mut(&mut self) -> &mut Env {
+        &mut self.evm.env
+    }
+
+    fn block_hash(&mut self, requested_number: u64) -> Option<B256> {
+        let block_number = as_u64_saturated!(self.env().block.number);
+
+        let Some(diff) = block_number.checked_sub(requested_number) else {
+            return Some(B256::ZERO);
+        };
+
+        // blockhash should push zero if number is same as current block number.
+        if diff == 0 {
+            return Some(B256::ZERO);
+        }
+
+        if diff <= BLOCK_HASH_HISTORY {
+            return self
+                .evm
+                .block_hash(requested_number)
+                .map_err(|e| self.evm.error = Err(e))
+                .ok();
+        }
+
+        Some(B256::ZERO)
+    }
+
+    fn load_account_delegated(&mut self, address: Address) -> Option<AccountLoad> {
+        self.evm
+            .load_account_delegated(address)
+            .map_err(|e| self.evm.error = Err(e))
+            .ok()
+    }
+
+    fn balance(&mut self, address: Address) -> Option<StateLoad<U256>> {
+        self.evm
+            .balance(address)
+            .map_err(|e| self.evm.error = Err(e))
+            .ok()
+    }
+
+    fn code(&mut self, address: Address) -> Option<Eip7702CodeLoad<Bytes>> {
+        self.evm
+            .code(address)
+            .map_err(|e| self.evm.error = Err(e))
+            .ok()
+    }
+
+    fn code_hash(&mut self, address: Address) -> Option<Eip7702CodeLoad<B256>> {
+        self.evm
+            .code_hash(address)
+            .map_err(|e| self.evm.error = Err(e))
+            .ok()
+    }
+
+    fn sload(&mut self, address: Address, index: U256) -> Option<StateLoad<U256>> {
+        self.evm
+            .sload(address, index)
+            .map_err(|e| self.evm.error = Err(e))
+            .ok()
+    }
+
+    fn sstore(
+        &mut self,
+        address: Address,
+        index: U256,
+        value: U256,
+    ) -> Option<StateLoad<SStoreResult>> {
+        self.evm
+            .sstore(address, index, value)
+            .map_err(|e| self.evm.error = Err(e))
+            .ok()
+    }
+
+    fn tload(&mut self, address: Address, index: U256) -> U256 {
+        self.evm.tload(address, index)
+    }
+
+    fn tstore(&mut self, address: Address, index: U256, value: U256) {
+        self.evm.tstore(address, index, value)
+    }
+
+    fn log(&mut self, log: Log) {
+        self.evm.journaled_state.log(log);
+    }
+
+    fn selfdestruct(
+        &mut self,
+        address: Address,
+        target: Address,
+    ) -> Option<StateLoad<SelfDestructResult>> {
+        self.evm
+            .inner
+            .journaled_state
+            .selfdestruct(address, target, &mut self.evm.inner.db)
+            .map_err(|e| self.evm.error = Err(e))
+            .ok()
     }
 }

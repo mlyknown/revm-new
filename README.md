@@ -14,7 +14,7 @@
 
 **Rust Ethereum Virtual Machine**
 
-![](./assets/revm-banner.png)
+![](./assets/logo/revm-banner.png)
 
 Revm is an EVM written in Rust that is focused on **speed** and **simplicity**.
 It has a fast and flexible implementation with a simple interface and embedded Host.
@@ -111,14 +111,17 @@ cargo run -p revm --features std,serde-json,ethersdb --example generate_block_tr
 
 # Used by:
 
-- [Foundry](https://github.com/foundry-rs/foundry) is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.
-- [Helios](https://github.com/a16z/helios) is a fully trustless, efficient, and portable Ethereum light client written in Rust.
-- [Reth](https://github.com/paradigmxyz/reth) Modular, contributor-friendly and blazing-fast implementation of the Ethereum protocol
-- [Arbiter](https://github.com/primitivefinance/arbiter) is a framework for stateful Ethereum smart-contract simulation
-- [Zeth](https://github.com/risc0/zeth) is an open-source ZK block prover for Ethereum built on the RISC Zero zkVM.
-- [VERBS](https://github.com/simtopia/verbs) an open-source Ethereum agent-based modelling and simulation library with a Python API.
-- [Hardhat](https://github.com/NomicFoundation/hardhat) is a development environment to compile, deploy, test, and debug your Ethereum software.
-- ...
+* [Foundry](https://github.com/foundry-rs/foundry) is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.
+* [Helios](https://github.com/a16z/helios) is a fully trustless, efficient, and portable Ethereum light client written in Rust.
+* [Reth](https://github.com/paradigmxyz/reth) Modular, contributor-friendly and blazing-fast implementation of the Ethereum protocol
+* [Arbiter](https://github.com/primitivefinance/arbiter) is a framework for stateful Ethereum smart-contract simulation
+* [Zeth](https://github.com/risc0/zeth) is an open-source ZK block prover for Ethereum built on the RISC Zero zkVM.
+* [VERBS](https://github.com/simtopia/verbs) an open-source Ethereum agent-based modelling and simulation library with a Python API.
+* [Hardhat](https://github.com/NomicFoundation/hardhat) is a development environment to compile, deploy, test, and debug your Ethereum software.
+* [Trin](https://github.com/ethereum/trin) is Portal Network client. An execution and consensus layer Ethereum light client written in Rust. Portal Network client's provide complete, provable, and distributed execution archival access.
+* [Simular](https://github.com/simular-fi/simular/) is a Python smart-contract API with a fast, embedded, Ethereum Virtual Machine.
+* [rbuilder](https://github.com/flashbots/rbuilder) is a state of the art Ethereum MEV-Boost block builder written in Rust and designed to work with Reth.
+* ...
 
 (If you want to add project to the list, ping me or open the PR)
 

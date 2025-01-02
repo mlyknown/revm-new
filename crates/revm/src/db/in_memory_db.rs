@@ -43,14 +43,14 @@ impl<ExtDB: Default> Default for CacheDB<ExtDB> {
 
 impl<ExtDB> CacheDB<ExtDB> {
     pub fn new(db: ExtDB) -> Self {
-        let mut contracts = HashMap::new();
-        contracts.insert(KECCAK_EMPTY, Bytecode::new());
-        contracts.insert(B256::ZERO, Bytecode::new());
+        let mut contracts = HashMap::default();
+        contracts.insert(KECCAK_EMPTY, Bytecode::default());
+        contracts.insert(B256::ZERO, Bytecode::default());
         Self {
-            accounts: HashMap::new(),
+            accounts: HashMap::default(),
             contracts,
             logs: Vec::default(),
-            block_hashes: HashMap::new(),
+            block_hashes: HashMap::default(),
             db,
         }
     }
@@ -71,7 +71,7 @@ impl<ExtDB> CacheDB<ExtDB> {
                     .or_insert_with(|| code.clone());
             }
         }
-        if account.code_hash == B256::ZERO {
+        if account.code_hash.is_zero() {
             account.code_hash = KECCAK_EMPTY;
         }
     }
@@ -234,8 +234,8 @@ impl<ExtDB: DatabaseRef> Database for CacheDB<ExtDB> {
         }
     }
 
-    fn block_hash(&mut self, number: U256) -> Result<B256, Self::Error> {
-        match self.block_hashes.entry(number) {
+    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+        match self.block_hashes.entry(U256::from(number)) {
             Entry::Occupied(entry) => Ok(*entry.get()),
             Entry::Vacant(entry) => {
                 let hash = self.db.block_hash_ref(number)?;
@@ -282,8 +282,8 @@ impl<ExtDB: DatabaseRef> DatabaseRef for CacheDB<ExtDB> {
         }
     }
 
-    fn block_hash_ref(&self, number: U256) -> Result<B256, Self::Error> {
-        match self.block_hashes.get(&number) {
+    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+        match self.block_hashes.get(&U256::from(number)) {
             Some(entry) => Ok(*entry),
             None => self.db.block_hash_ref(number),
         }
@@ -360,12 +360,33 @@ impl AccountState {
 ///
 /// Any other address will return an empty account.
 #[derive(Debug, Default, Clone)]
-pub struct BenchmarkDB(pub Bytecode, B256);
+pub struct BenchmarkDB {
+    pub bytecode: Bytecode,
+    pub hash: B256,
+    pub target: Address,
+    pub caller: Address,
+}
 
 impl BenchmarkDB {
+    /// Create a new benchmark database with the given bytecode.
     pub fn new_bytecode(bytecode: Bytecode) -> Self {
         let hash = bytecode.hash_slow();
-        Self(bytecode, hash)
+        Self {
+            bytecode,
+            hash,
+            target: Address::ZERO,
+            caller: Address::with_last_byte(1),
+        }
+    }
+
+    /// Change the caller address for the benchmark.
+    pub fn with_caller(self, caller: Address) -> Self {
+        Self { caller, ..self }
+    }
+
+    /// Change the target address for the benchmark.
+    pub fn with_target(self, target: Address) -> Self {
+        Self { target, ..self }
     }
 }
 
@@ -373,15 +394,15 @@ impl Database for BenchmarkDB {
     type Error = Infallible;
     /// Get basic account information.
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        if address == Address::ZERO {
+        if address == self.target {
             return Ok(Some(AccountInfo {
                 nonce: 1,
                 balance: U256::from(10000000),
-                code: Some(self.0.clone()),
-                code_hash: self.1,
+                code: Some(self.bytecode.clone()),
+                code_hash: self.hash,
             }));
         }
-        if address == Address::with_last_byte(1) {
+        if address == self.caller {
             return Ok(Some(AccountInfo {
                 nonce: 0,
                 balance: U256::from(10000000),
@@ -403,7 +424,7 @@ impl Database for BenchmarkDB {
     }
 
     // History related
-    fn block_hash(&mut self, _number: U256) -> Result<B256, Self::Error> {
+    fn block_hash(&mut self, _number: u64) -> Result<B256, Self::Error> {
         Ok(B256::default())
     }
 }
@@ -411,7 +432,7 @@ impl Database for BenchmarkDB {
 #[cfg(test)]
 mod tests {
     use super::{CacheDB, EmptyDB};
-    use crate::primitives::{db::Database, AccountInfo, Address, U256};
+    use crate::primitives::{db::Database, AccountInfo, Address, HashMap, U256};
 
     #[test]
     fn test_insert_account_storage() {
@@ -457,7 +478,7 @@ mod tests {
 
         let mut new_state = CacheDB::new(init_state);
         new_state
-            .replace_account_storage(account, [(key1, value1)].into())
+            .replace_account_storage(account, HashMap::from_iter([(key1, value1)]))
             .unwrap();
 
         assert_eq!(new_state.basic(account).unwrap().unwrap().nonce, nonce);
@@ -482,7 +503,7 @@ mod tests {
         let serialized = serde_json::to_string(&init_state).unwrap();
         let deserialized: CacheDB<EmptyDB> = serde_json::from_str(&serialized).unwrap();
 
-        assert!(deserialized.accounts.get(&account).is_some());
+        assert!(deserialized.accounts.contains_key(&account));
         assert_eq!(
             deserialized.accounts.get(&account).unwrap().info.nonce,
             nonce

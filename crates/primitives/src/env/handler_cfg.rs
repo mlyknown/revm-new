@@ -60,7 +60,7 @@ impl HandlerCfg {
 }
 
 /// Configuration environment with the chain spec id.
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CfgEnvWithHandlerCfg {
     /// Configuration environment.
     pub cfg_env: CfgEnv,
@@ -106,9 +106,9 @@ impl Deref for CfgEnvWithHandlerCfg {
 }
 
 /// Evm environment with the chain spec id.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct EnvWithHandlerCfg {
-    /// Evm enironment.
+    /// Evm environment.
     pub env: Box<Env>,
     /// Handler configuration fields.
     pub handler_cfg: HandlerCfg,
